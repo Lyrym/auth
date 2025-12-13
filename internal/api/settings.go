@@ -17,6 +17,7 @@ type ProviderSettings struct {
 	Google         bool `json:"google"`
 	Keycloak       bool `json:"keycloak"`
 	Kakao          bool `json:"kakao"`
+	Line           bool `json:"line"`
 	Linkedin       bool `json:"linkedin"`
 	LinkedinOIDC   bool `json:"linkedin_oidc"`
 	Notion         bool `json:"notion"`
@@ -58,6 +59,7 @@ func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 			GitLab:         config.External.Gitlab.Enabled,
 			Google:         config.External.Google.Enabled,
 			Kakao:          config.External.Kakao.Enabled,
+			Line:           config.External.Line.Enabled,
 			Keycloak:       config.External.Keycloak.Enabled,
 			Linkedin:       config.External.Linkedin.Enabled,
 			LinkedinOIDC:   config.External.LinkedinOIDC.Enabled,
