@@ -65,7 +65,7 @@ func (p lineProvider) GetOAuthToken(ctx context.Context, code string, opts ...oa
 }
 
 func (p lineProvider) RequiresPKCE() bool {
-	return false
+	return true
 }
 
 
