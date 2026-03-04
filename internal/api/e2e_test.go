@@ -66,7 +66,12 @@ func runVerifyBeforeUserCreatedHook(
 		hookReq := &v0hooks.BeforeUserCreatedInput{}
 		err := call.Unmarshal(hookReq)
 		require.NoError(t, err)
+
+		require.NotNil(t, hookReq.Metadata)
+		require.NotEmpty(t, hookReq.Metadata.IPAddress)
 		require.Equal(t, v0hooks.BeforeUserCreated, hookReq.Metadata.Name)
+		require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+		require.False(t, hookReq.Metadata.Time.IsZero())
 
 		u := hookReq.User
 		require.Equal(t, expUser.ID, u.ID)
@@ -103,7 +108,12 @@ func runVerifyAfterUserCreatedHook(
 		hookReq := &v0hooks.AfterUserCreatedInput{}
 		err := call.Unmarshal(hookReq)
 		require.NoError(t, err)
+
+		require.NotNil(t, hookReq.Metadata)
+		require.NotEmpty(t, hookReq.Metadata.IPAddress)
 		require.Equal(t, v0hooks.AfterUserCreated, hookReq.Metadata.Name)
+		require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+		require.False(t, hookReq.Metadata.Time.IsZero())
 
 		u := hookReq.User
 		require.Equal(t, expUser.ID, u.ID)
@@ -175,6 +185,12 @@ func signupAndConfirmEmail(
 	hookReq := &v0hooks.SendEmailInput{}
 	err = call.Unmarshal(hookReq)
 	require.NoError(t, err)
+
+	require.NotNil(t, hookReq.Metadata)
+	require.NotEmpty(t, hookReq.Metadata.IPAddress)
+	require.Equal(t, v0hooks.SendEmail, hookReq.Metadata.Name)
+	require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+	require.False(t, hookReq.Metadata.Time.IsZero())
 
 	// verify that the latest user from find user matches OTP
 	otpHash := crypto.GenerateTokenHash(
@@ -285,6 +301,12 @@ func TestE2EHooks(t *testing.T) {
 				err = call.Unmarshal(hookReq)
 				require.NoError(t, err)
 
+				require.NotNil(t, hookReq.Metadata)
+				require.NotEmpty(t, hookReq.Metadata.IPAddress)
+				require.Equal(t, v0hooks.SendSMS, hookReq.Metadata.Name)
+				require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+				require.False(t, hookReq.Metadata.Time.IsZero())
+
 				latestUser, err := models.FindUserByID(inst.Conn, signupUser.ID)
 				require.NoError(t, err)
 				require.NotNil(t, latestUser)
@@ -382,6 +404,12 @@ func TestE2EHooks(t *testing.T) {
 					hookReq := &v0hooks.SendSMSInput{}
 					err = call.Unmarshal(hookReq)
 					require.NoError(t, err)
+
+					require.NotNil(t, hookReq.Metadata)
+					require.NotEmpty(t, hookReq.Metadata.IPAddress)
+					require.Equal(t, v0hooks.SendSMS, hookReq.Metadata.Name)
+					require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+					require.False(t, hookReq.Metadata.Time.IsZero())
 
 					require.Equal(t, currentUser.ID, hookReq.User.ID)
 					require.Equal(t, currentUser.Aud, hookReq.User.Aud)
@@ -924,6 +952,13 @@ func TestE2EHooks(t *testing.T) {
 					hookReq := &v0hooks.CustomAccessTokenInput{}
 					err := call.Unmarshal(hookReq)
 					require.NoError(t, err)
+
+					require.NotNil(t, hookReq.Metadata)
+					require.NotEmpty(t, hookReq.Metadata.IPAddress)
+					require.Equal(t, v0hooks.CustomizeAccessToken, hookReq.Metadata.Name)
+					require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+					require.False(t, hookReq.Metadata.Time.IsZero())
+
 					require.Equal(t, currentUser.ID, hookReq.UserID)
 					require.Equal(t, currentUser.ID.String(), hookReq.Claims.Subject)
 				}
@@ -971,6 +1006,90 @@ func TestE2EHooks(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("AMRStringArrayUnmarshalling", func(t *testing.T) {
+			defer inst.HookRecorder.CustomizeAccessToken.ClearCalls()
+
+			// Setup hook that returns amr as array of strings
+			var claimsIn M
+			hr := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Add("content-type", "application/json")
+				w.WriteHeader(http.StatusOK)
+
+				err := json.NewDecoder(r.Body).Decode(&claimsIn)
+				require.NoError(t, err)
+
+				// Modify amr to be array of strings instead of objects
+				claimsOut := copyMap(t, claimsIn)
+				claimsOut["claims"].(M)["amr"] = []string{"password", "totp"}
+
+				err = json.NewEncoder(w).Encode(claimsOut)
+				require.NoError(t, err)
+			})
+
+			inst.HookRecorder.CustomizeAccessToken.ClearCalls()
+			inst.HookRecorder.CustomizeAccessToken.SetHandler(hr)
+
+			// Get token with modified amr
+			req := &api.PasswordGrantParams{
+				Email:    string(currentUser.Email),
+				Password: defaultPassword,
+			}
+
+			res := new(api.AccessTokenResponse)
+			err := e2eapi.Do(ctx, http.MethodPost, inst.APIServer.URL+"/token?grant_type=password", req, res)
+			require.NoError(t, err)
+			require.True(t, len(res.Token) > 0)
+
+			// Verify hook was called
+			{
+				calls := inst.HookRecorder.CustomizeAccessToken.GetCalls()
+				require.Equal(t, 1, len(calls))
+			}
+
+			// Parse token to verify it can be unmarshalled
+			p := jwt.NewParser(jwt.WithValidMethods(globalCfg.JWT.ValidMethods))
+			token, err := p.ParseWithClaims(
+				res.Token,
+				&api.AccessTokenClaims{},
+				func(token *jwt.Token) (any, error) {
+					if kid, ok := token.Header["kid"]; ok {
+						if kidStr, ok := kid.(string); ok {
+							return conf.FindPublicKeyByKid(kidStr, &globalCfg.JWT)
+						}
+					}
+					if alg, ok := token.Header["alg"]; ok {
+						if alg == jwt.SigningMethodHS256.Name {
+							return []byte(globalCfg.JWT.Secret), nil
+						}
+					}
+					return nil, fmt.Errorf("missing kid")
+				})
+			require.NoError(t, err, "Token should parse successfully even with string array amr")
+
+			fmt.Println("token hereee", res.Token)
+			// Verify claims were unmarshalled correctly
+			claims, ok := token.Claims.(*api.AccessTokenClaims)
+			require.True(t, ok, "Claims should be AccessTokenClaims type")
+			require.NotNil(t, claims.AuthenticationMethodReference, "AMR should not be nil")
+			require.Len(t, claims.AuthenticationMethodReference, 2, "AMR should have 2 entries")
+			require.Equal(t, "password", claims.AuthenticationMethodReference[0].Method)
+			require.Equal(t, "totp", claims.AuthenticationMethodReference[1].Method)
+
+			// Call /user endpoint with the token to verify it works end-to-end
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "/user", nil)
+			require.NoError(t, err)
+
+			httpRes, err := inst.DoAuth(httpReq, res.Token)
+			require.NoError(t, err, "Should be able to call /user endpoint with token containing string array amr")
+			require.Equal(t, http.StatusOK, httpRes.StatusCode, "/user endpoint should return 200 OK")
+
+			// Verify we got user data back
+			var userData models.User
+			err = json.NewDecoder(httpRes.Body).Decode(&userData)
+			require.NoError(t, err, "Should be able to decode user response")
+			require.Equal(t, currentUser.ID, userData.ID, "Should get the correct user")
+		})
 	})
 
 	t.Run("SendEmail", func(t *testing.T) {
@@ -1042,6 +1161,12 @@ func TestE2EHooks(t *testing.T) {
 				hookReq := &v0hooks.SendEmailInput{}
 				err = call.Unmarshal(hookReq)
 				require.NoError(t, err)
+
+				require.NotNil(t, hookReq.Metadata)
+				require.NotEmpty(t, hookReq.Metadata.IPAddress)
+				require.Equal(t, v0hooks.SendEmail, hookReq.Metadata.Name)
+				require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+				require.False(t, hookReq.Metadata.Time.IsZero())
 
 				// hook user matches the signup user
 				require.Equal(t, signupUser.ID, hookReq.User.ID)
@@ -1156,6 +1281,12 @@ func TestE2EHooks(t *testing.T) {
 				err = call.Unmarshal(hookReq)
 				require.NoError(t, err)
 
+				require.NotNil(t, hookReq.Metadata)
+				require.NotEmpty(t, hookReq.Metadata.IPAddress)
+				require.Equal(t, v0hooks.SendEmail, hookReq.Metadata.Name)
+				require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+				require.False(t, hookReq.Metadata.Time.IsZero())
+
 				// verify there is an ott generated
 				ott, err := models.FindOneTimeToken(
 					inst.Conn,
@@ -1258,6 +1389,12 @@ func TestE2EHooks(t *testing.T) {
 				hookReq := &v0hooks.SendEmailInput{}
 				err = call.Unmarshal(hookReq)
 				require.NoError(t, err)
+
+				require.NotNil(t, hookReq.Metadata)
+				require.NotEmpty(t, hookReq.Metadata.IPAddress)
+				require.Equal(t, v0hooks.SendEmail, hookReq.Metadata.Name)
+				require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+				require.False(t, hookReq.Metadata.Time.IsZero())
 
 				// hook user matches the signup user
 				require.Equal(t, signupUser.ID, hookReq.User.ID)
@@ -1368,6 +1505,12 @@ func TestE2EHooks(t *testing.T) {
 				hookReq := &v0hooks.SendEmailInput{}
 				err = call.Unmarshal(hookReq)
 				require.NoError(t, err)
+
+				require.NotNil(t, hookReq.Metadata)
+				require.NotEmpty(t, hookReq.Metadata.IPAddress)
+				require.Equal(t, v0hooks.SendEmail, hookReq.Metadata.Name)
+				require.NotEqual(t, uuid.Nil, hookReq.Metadata.UUID)
+				require.False(t, hookReq.Metadata.Time.IsZero())
 
 				// verify there is an ott generated
 				ott, err := models.FindOneTimeToken(

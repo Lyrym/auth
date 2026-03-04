@@ -11,6 +11,7 @@ import (
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/apitask"
 	"github.com/supabase/auth/internal/api/oauthserver"
+	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/hooks/hookshttp"
 	"github.com/supabase/auth/internal/hooks/hookspgfunc"
@@ -19,6 +20,7 @@ import (
 	"github.com/supabase/auth/internal/mailer/templatemailer"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
+	"github.com/supabase/auth/internal/sbff"
 	"github.com/supabase/auth/internal/storage"
 	"github.com/supabase/auth/internal/tokens"
 	"github.com/supabase/auth/internal/utilities"
@@ -30,7 +32,7 @@ const (
 	defaultVersion = "unknown version"
 )
 
-var bearerRegexp = regexp.MustCompile(`^(?:B|b)earer (\S+$)`)
+var bearerRegexp = regexp.MustCompile(`(?i)^bearer (\S+$)`)
 
 // API is the main REST API
 type API struct {
@@ -44,6 +46,7 @@ type API struct {
 	oauthServer  *oauthserver.Server
 	tokenService *tokens.Service
 	mailer       mailer.Mailer
+	oidcCache    *provider.OIDCProviderCache
 
 	// overrideTime can be used to override the clock used by handlers. Should only be used in tests!
 	overrideTime func() time.Time
@@ -94,6 +97,8 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 		db:      db,
 		version: version,
 	}
+
+	api.oidcCache = provider.NewOIDCProviderCache(globalConfig.External.OIDCProviderCacheTTL)
 
 	for _, o := range opt {
 		o.apply(api)
@@ -150,10 +155,20 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 	logger := observability.NewStructuredLogger(logrus.StandardLogger(), globalConfig)
 
 	r := newRouter()
+	r.UseBypass(recoverer)
 	r.UseBypass(observability.AddRequestID(globalConfig))
+	r.UseBypass(
+		sbff.Middleware(
+			&globalConfig.Security,
+			func(r *http.Request, err error) {
+				log := observability.GetLogEntry(r).Entry
+				log.WithField("error", err.Error()).Warn("error processing Sb-Forwarded-For")
+			},
+		),
+	)
 	r.UseBypass(logger)
 	r.UseBypass(xffmw.Handler)
-	r.UseBypass(recoverer)
+	r.UseBypass(limitRequestBody(1 << 20)) // 1MB
 
 	if globalConfig.API.MaxRequestDuration > 0 {
 		r.UseBypass(timeoutMiddleware(globalConfig.API.MaxRequestDuration))
@@ -362,6 +377,21 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 							r.Delete("/", api.oauthServer.OAuthServerClientDelete)
 							r.Post("/regenerate_secret", api.oauthServer.OAuthServerClientRegenerateSecret)
 						})
+					})
+				})
+			}
+
+			// Custom OAuth/OIDC provider management endpoints
+			if globalConfig.CustomOAuth.Enabled {
+				r.Route("/custom-providers", func(r *router) {
+					// supports both OAuth2 and OIDC via provider_type)
+					r.Get("/", api.adminCustomOAuthProvidersList)   // Optional ?type=oauth2 or ?type=oidc filter
+					r.Post("/", api.adminCustomOAuthProviderCreate) // provider_type in request body
+
+					r.Route("/{identifier}", func(r *router) {
+						r.Get("/", api.adminCustomOAuthProviderGet)
+						r.Put("/", api.adminCustomOAuthProviderUpdate)
+						r.Delete("/", api.adminCustomOAuthProviderDelete)
 					})
 				})
 			}

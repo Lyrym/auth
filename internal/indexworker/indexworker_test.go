@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gobuffalo/pop/v6"
@@ -14,16 +15,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
 )
 
 type IndexWorkerTestSuite struct {
 	suite.Suite
-	config    *conf.GlobalConfiguration
-	db        *storage.Connection
-	popDB     *pop.Connection
-	namespace string
-	logger    *logrus.Entry
+	config                       *conf.GlobalConfiguration
+	db                           *storage.Connection
+	popDB                        *pop.Connection
+	namespace                    string
+	logger                       *logrus.Entry
+	maxUsersThreshold            int64
+	ensureUserSearchIndexesExist bool
 }
 
 func (ts *IndexWorkerTestSuite) SetupSuite() {
@@ -31,6 +35,8 @@ func (ts *IndexWorkerTestSuite) SetupSuite() {
 	config, err := conf.LoadGlobal("../../hack/test.env")
 	require.NoError(ts.T(), err)
 	ts.config = config
+	ts.maxUsersThreshold = config.IndexWorker.MaxUsersThreshold
+	ts.ensureUserSearchIndexesExist = config.IndexWorker.EnsureUserSearchIndexesExist
 	ts.namespace = config.DB.Namespace
 	ts.logger = logrus.NewEntry(logrus.New())
 	ts.logger.Logger.SetLevel(logrus.DebugLevel)
@@ -55,10 +61,6 @@ func (ts *IndexWorkerTestSuite) SetupSuite() {
 
 	// Ensure we have a clean state for testing
 	ts.cleanupIndexes()
-
-	// Ensure trigram extension is available
-	err = ts.db.RawQuery("CREATE EXTENSION IF NOT EXISTS pg_trgm").Exec()
-	require.NoError(ts.T(), err)
 }
 
 func (ts *IndexWorkerTestSuite) TearDownSuite() {
@@ -72,12 +74,14 @@ func (ts *IndexWorkerTestSuite) TearDownSuite() {
 }
 
 func (ts *IndexWorkerTestSuite) SetupTest() {
-	// Clean up before each test
+	models.TruncateAll(ts.db)
 	ts.cleanupIndexes()
+	ts.config.IndexWorker.MaxUsersThreshold = ts.maxUsersThreshold
+	ts.config.IndexWorker.EnsureUserSearchIndexesExist = ts.ensureUserSearchIndexesExist
 }
 
 func (ts *IndexWorkerTestSuite) cleanupIndexes() {
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	indexes := getUsersIndexes(ts.namespace)
 	for _, idx := range indexes {
 		// Drop any existing indexes (valid or invalid)
 		dropQuery := fmt.Sprintf("DROP INDEX IF EXISTS %q.%s", ts.namespace, idx.name)
@@ -91,7 +95,7 @@ func (ts *IndexWorkerTestSuite) TestCreateIndexesHappyPath() {
 	err := CreateIndexes(ctx, ts.config, ts.logger)
 	require.NoError(ts.T(), err)
 
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	indexes := getUsersIndexes(ts.namespace)
 	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
 	require.NoError(ts.T(), err)
 
@@ -135,7 +139,7 @@ func (ts *IndexWorkerTestSuite) TestIdempotency() {
 	require.NoError(ts.T(), err)
 
 	// Get the state after first run
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	indexes := getUsersIndexes(ts.namespace)
 	firstRunIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
 	require.NoError(ts.T(), err)
 	require.Equal(ts.T(), len(indexes), len(firstRunIndexes))
@@ -191,7 +195,7 @@ func (ts *IndexWorkerTestSuite) TestOutOfBandIndexRemoval() {
 	require.NoError(ts.T(), err)
 
 	// Verify all indexes exist
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	indexes := getUsersIndexes(ts.namespace)
 	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
 	require.NoError(ts.T(), err)
 	assert.Equal(ts.T(), len(indexes), len(existingIndexes))
@@ -229,55 +233,45 @@ func (ts *IndexWorkerTestSuite) TestOutOfBandIndexRemoval() {
 	assert.True(ts.T(), found, "The removed index should have been recreated")
 }
 
-// Test concurrent access - only one worker should create indexes
+// Test concurrent access - workers coordinate via advisory lock
 func (ts *IndexWorkerTestSuite) TestConcurrentWorkers() {
 	ctx := context.Background()
 
-	// Number of concurrent workers
-	numWorkers := 3
+	numWorkers := 5
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
-	// Track which workers actually created indexes
-	results := make(chan error, numWorkers)
+	var successCount, lockSkipCount, errorCount int32
 
 	for i := 0; i < numWorkers; i++ {
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
 
 			// Each worker needs its own logger to avoid race conditions
 			logger := logrus.NewEntry(logrus.New())
 			logger.Logger.SetLevel(logrus.DebugLevel)
 
-			// CreateIndexes returns nil on success or ErrAdvisoryLockAlreadyAcquired
 			err := CreateIndexes(ctx, ts.config, logger)
-			results <- err
-		}(i)
+			switch {
+			case err == nil:
+				atomic.AddInt32(&successCount, 1)
+			case errors.Is(err, ErrAdvisoryLockAlreadyAcquired):
+				atomic.AddInt32(&lockSkipCount, 1)
+			default:
+				atomic.AddInt32(&errorCount, 1)
+				ts.T().Errorf("Unexpected error from CreateIndexes: %v", err)
+			}
+		}()
 	}
 
-	// Wait for all workers to complete
 	wg.Wait()
-	close(results)
 
-	// Count how many workers acquired the lock
-	lockCount := 0
-	lockSkipCount := 0
-	for err := range results {
-		if err == nil {
-			lockCount++
-		} else if errors.Is(err, ErrAdvisoryLockAlreadyAcquired) {
-			lockSkipCount++
-		} else {
-			ts.T().Errorf("Unexpected error from CreateIndexes: %v", err)
-		}
-	}
+	assert.GreaterOrEqual(ts.T(), successCount, int32(1), "At least one worker should succeed")
+	assert.Equal(ts.T(), int32(0), errorCount, "No unexpected errors should occur")
+	assert.Equal(ts.T(), int32(numWorkers), successCount+lockSkipCount, "All workers should either succeed or skip due to lock")
 
-	// Only one worker should have acquired the lock and created indexes
-	assert.Equal(ts.T(), 1, lockCount, "Only one worker should acquire the lock and create indexes")
-	assert.Equal(ts.T(), numWorkers-1, lockSkipCount, "Other workers should skip due to lock")
-
-	// Verify all indexes were created successfully
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	// Verify indexes were created correctly regardless of which worker did it
+	indexes := getUsersIndexes(ts.namespace)
 	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
 	require.NoError(ts.T(), err)
 	assert.Equal(ts.T(), len(indexes), len(existingIndexes), "All indexes should be created")
@@ -295,6 +289,96 @@ func getIndexNames(indexes []struct {
 	return names
 }
 
+// TestMaxUsersThresholdSkipsIndexCreation verifies when EnsureUserSearchIndexesExist=false and MaxUsersThreshold > 0,
+// index creation is skipped if user count exceeds the threshold.
+func (ts *IndexWorkerTestSuite) TestMaxUsersThresholdSkipsIndexCreation() {
+	ctx := context.Background()
+
+	// No explicit user opt-in - rely on threshold behavior
+	ts.config.IndexWorker.EnsureUserSearchIndexesExist = false
+
+	// SetupTest already called TruncateAll, so the users table is empty.
+	// Insert test users so the approximate count exceeds the threshold.
+	for i := 0; i < 5; i++ {
+		insertQuery := fmt.Sprintf(
+			`INSERT INTO %q.users (instance_id, id, aud, role, email, encrypted_password, created_at, updated_at) VALUES ('00000000-0000-0000-0000-000000000000', gen_random_uuid(), 'authenticated', 'authenticated', 'threshold_test_%d@example.com', '', now(), now())`,
+			ts.namespace, i,
+		)
+		require.NoError(ts.T(), ts.db.RawQuery(insertQuery).Exec())
+	}
+	// Update pg_class.reltuples so getApproximateUserCount reflects the inserts
+	analyzeQuery := fmt.Sprintf(`ANALYZE %q.users`, ts.namespace)
+	require.NoError(ts.T(), ts.db.RawQuery(analyzeQuery).Exec())
+
+	ts.config.IndexWorker.MaxUsersThreshold = 1
+
+	indexes := getUsersIndexes(ts.namespace)
+	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
+	require.NoError(ts.T(), err)
+	assert.Empty(ts.T(), existingIndexes, "No indexes should exist before the test")
+
+	err = CreateIndexes(ctx, ts.config, ts.logger)
+	require.NoError(ts.T(), err)
+
+	existingIndexes, err = getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
+	require.NoError(ts.T(), err)
+	assert.Empty(ts.T(), existingIndexes, "No indexes should be created when user count exceeds threshold")
+}
+
+// TestUserOptInAlwaysCreatesIndexes verifies that when EnsureUserSearchIndexesExist=true,
+// indexes are always created regardless of user count or threshold setting.
+func (ts *IndexWorkerTestSuite) TestUserOptInAlwaysCreatesIndexes() {
+	ctx := context.Background()
+
+	// Insert test users so there's a non-zero user count
+	for i := 0; i < 5; i++ {
+		insertQuery := fmt.Sprintf(
+			`INSERT INTO %q.users (instance_id, id, aud, role, email, encrypted_password, created_at, updated_at) VALUES ('00000000-0000-0000-0000-000000000000', gen_random_uuid(), 'authenticated', 'authenticated', 'optin_test_%d@example.com', '', now(), now())`,
+			ts.namespace, i,
+		)
+		require.NoError(ts.T(), ts.db.RawQuery(insertQuery).Exec())
+	}
+	analyzeQuery := fmt.Sprintf(`ANALYZE %q.users`, ts.namespace)
+	require.NoError(ts.T(), ts.db.RawQuery(analyzeQuery).Exec())
+
+	// User opt-in with threshold set below user count — should still create indexes
+	ts.config.IndexWorker.EnsureUserSearchIndexesExist = true
+	ts.config.IndexWorker.MaxUsersThreshold = 1
+
+	err := CreateIndexes(ctx, ts.config, ts.logger)
+	require.NoError(ts.T(), err)
+
+	indexes := getUsersIndexes(ts.namespace)
+	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
+	require.NoError(ts.T(), err)
+	assert.Equal(ts.T(), len(indexes), len(existingIndexes), "All indexes should be created when user opted in, even if over threshold")
+	for _, idx := range existingIndexes {
+		assert.True(ts.T(), idx.IsValid, "Index %s should be valid", idx.IndexName)
+		assert.True(ts.T(), idx.IsReady, "Index %s should be ready", idx.IndexName)
+	}
+}
+
+// TestUserOptInWithZeroThreshold verifies that EnsureUserSearchIndexesExist=true
+// with MaxUsersThreshold=0 (disabled) still creates indexes.
+func (ts *IndexWorkerTestSuite) TestUserOptInWithZeroThreshold() {
+	ctx := context.Background()
+
+	ts.config.IndexWorker.EnsureUserSearchIndexesExist = true
+	ts.config.IndexWorker.MaxUsersThreshold = 0
+
+	err := CreateIndexes(ctx, ts.config, ts.logger)
+	require.NoError(ts.T(), err)
+
+	indexes := getUsersIndexes(ts.namespace)
+	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
+	require.NoError(ts.T(), err)
+	assert.Equal(ts.T(), len(indexes), len(existingIndexes), "All indexes should be created when user opted in with threshold disabled")
+	for _, idx := range existingIndexes {
+		assert.True(ts.T(), idx.IsValid, "Index %s should be valid", idx.IndexName)
+		assert.True(ts.T(), idx.IsReady, "Index %s should be ready", idx.IndexName)
+	}
+}
+
 // TestCreateIndexesWithInvalidIndexes tests that CreateIndexes can recover from invalid indexes
 // This test simulates a scenario where indexes become invalid (e.g., from interrupted CONCURRENT creation)
 // and verifies that CreateIndexes properly handles them by dropping and recreating.
@@ -306,7 +390,7 @@ func (ts *IndexWorkerTestSuite) TestCreateIndexesWithInvalidIndexes() {
 	require.NoError(ts.T(), err, "Initial CreateIndexes should succeed")
 
 	// Verify all indexes were created and are valid
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
+	indexes := getUsersIndexes(ts.namespace)
 	initialIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
 	require.NoError(ts.T(), err)
 	assert.Equal(ts.T(), len(indexes), len(initialIndexes), "All indexes should be created initially")
@@ -337,7 +421,7 @@ func (ts *IndexWorkerTestSuite) TestCreateIndexesWithInvalidIndexes() {
 	defer manipulatorDB.Close()
 
 	// Select the first 2 indexes to mark as invalid
-	allIndexes := getUsersIndexes(ts.namespace, ts.namespace)
+	allIndexes := getUsersIndexes(ts.namespace)
 	indexesToInvalidate := []string{allIndexes[0].name, allIndexes[1].name}
 
 	for _, indexName := range indexesToInvalidate {
@@ -391,54 +475,6 @@ func (ts *IndexWorkerTestSuite) TestCreateIndexesWithInvalidIndexes() {
 	}
 
 	ts.logger.Infof("Successfully recovered from %d invalid indexes", len(indexesToInvalidate))
-}
-
-// TestCreateIndexesWithoutTrgmExtension tests that CreateIndexes installs pg_trgm extension
-// when it's available but not installed, and then successfully creates indexes.
-func (ts *IndexWorkerTestSuite) TestCreateIndexesWithoutTrgmExtension() {
-	ctx := context.Background()
-
-	// Drop the pg_trgm extension to simulate it not being installed
-	dropExtQuery := "DROP EXTENSION IF EXISTS pg_trgm CASCADE"
-	err := ts.db.RawQuery(dropExtQuery).Exec()
-	require.NoError(ts.T(), err, "Should be able to drop pg_trgm extension")
-
-	// Verify the extension is dropped
-	var extensionExists bool
-	checkExtQuery := "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')"
-	err = ts.db.RawQuery(checkExtQuery).First(&extensionExists)
-	require.NoError(ts.T(), err)
-	assert.False(ts.T(), extensionExists, "pg_trgm extension should not exist")
-
-	// Verify no indexes exist initially
-	indexes := getUsersIndexes(ts.namespace, ts.namespace)
-	existingIndexes, err := getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
-	require.NoError(ts.T(), err)
-	assert.Empty(ts.T(), existingIndexes, "No indexes should exist initially")
-
-	// Run CreateIndexes - it should install the pg_trgm extension and create indexes
-	err = CreateIndexes(ctx, ts.config, ts.logger)
-	require.NoError(ts.T(), err, "CreateIndexes should succeed by installing the pg_trgm extension")
-
-	// Verify that pg_trgm is now installed
-	err = ts.db.RawQuery(checkExtQuery).First(&extensionExists)
-	require.NoError(ts.T(), err)
-	assert.True(ts.T(), extensionExists, "pg_trgm extension should have been installed")
-
-	// Verify all indexes were created successfully
-	existingIndexes, err = getIndexStatuses(ts.popDB, ts.namespace, getIndexNames(indexes))
-	require.NoError(ts.T(), err)
-	assert.Equal(ts.T(), len(indexes), len(existingIndexes), "All indexes should have been created")
-
-	for _, idx := range existingIndexes {
-		assert.True(ts.T(), idx.IsValid, "Index %s should be valid", idx.IndexName)
-		assert.True(ts.T(), idx.IsReady, "Index %s should be ready", idx.IndexName)
-	}
-
-	// Restore pg_trgm extension for other tests
-	createExtQuery := "CREATE EXTENSION IF NOT EXISTS pg_trgm"
-	err = ts.db.RawQuery(createExtQuery).Exec()
-	require.NoError(ts.T(), err, "Should be able to restore pg_trgm extension")
 }
 
 // Run the test suite

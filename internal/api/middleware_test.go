@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/sbff"
 	"github.com/supabase/auth/internal/storage"
 )
 
@@ -415,7 +416,166 @@ func TestTimeoutResponseWriter(t *testing.T) {
 	require.Equal(t, w1.Result(), w2.Result())
 }
 
-func (ts *MiddlewareTestSuite) TestPerformRateLimiting() {
+func (ts *MiddlewareTestSuite) TestPerformRateLimitingWithSBFF() {
+	origRateLimitHeader := ts.Config.RateLimitHeader
+	origSBFFEnabled := ts.Config.Security.SbForwardedForEnabled
+
+	defer func() {
+		ts.Config.RateLimitHeader = origRateLimitHeader
+		ts.Config.Security.SbForwardedForEnabled = origSBFFEnabled
+	}()
+
+	ts.Config.RateLimitHeader = "X-Test-Perform-Rate-Limiting"
+	ts.Config.Security.SbForwardedForEnabled = true
+
+	type headerSet struct {
+		rateLimiting   string
+		sbForwardedFor string
+	}
+
+	testCases := []struct {
+		name         string
+		headerValues []headerSet
+		expErr       error
+	}{
+		{
+			name: "multiple SBFF values, single rate limiting value",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "192.168.1.100",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "192.168.1.200",
+					rateLimiting:   "60.60.60.60",
+				},
+			},
+			expErr: nil,
+		},
+		{
+			name: "single SBFF value, multiple rate limiting values",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "192.168.1.100",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "192.168.1.100",
+					rateLimiting:   "70.70.70.70",
+				},
+			},
+			expErr: apierrors.NewTooManyRequestsError(
+				apierrors.ErrorCodeOverRequestRateLimit,
+				"Request rate limit reached",
+			),
+		},
+		{
+			name: "no SBFF value, multiple rate limiting values",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "",
+					rateLimiting:   "70.70.70.70",
+				},
+			},
+			expErr: nil,
+		},
+		{
+			name: "no SBFF value, single rate limiting value",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "",
+					rateLimiting:   "60.60.60.60",
+				},
+			},
+			expErr: apierrors.NewTooManyRequestsError(
+				apierrors.ErrorCodeOverRequestRateLimit,
+				"Request rate limit reached",
+			),
+		},
+		{
+			name: "invalid SBFF value, multiple rate limiting values",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "invalid",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "invalid",
+					rateLimiting:   "70.70.70.70",
+				},
+			},
+			expErr: nil,
+		},
+		{
+			name: "invalid SBFF value, single rate limiting value",
+			headerValues: []headerSet{
+				{
+					sbForwardedFor: "invalid",
+					rateLimiting:   "60.60.60.60",
+				},
+				{
+					sbForwardedFor: "invalid",
+					rateLimiting:   "60.60.60.60",
+				},
+			},
+			expErr: apierrors.NewTooManyRequestsError(
+				apierrors.ErrorCodeOverRequestRateLimit,
+				"Request rate limit reached",
+			),
+		},
+	}
+
+	// This test uses the SBFF middleware to inject the Sb-Forwarded-For IP address value, then
+	// wraps a handler that calls performRateLimiting and stores the error value.
+	for _, tc := range testCases {
+		lmt := tollbooth.NewLimiter(
+			1,
+			&limiter.ExpirableOptions{
+				DefaultExpirationTTL: time.Hour,
+			},
+		)
+
+		var obsErr error
+
+		var handler http.HandlerFunc = func(rw http.ResponseWriter, r *http.Request) {
+			obsErr = ts.API.performRateLimiting(lmt, r)
+		}
+
+		errCallback := func(r *http.Request, err error) {
+		}
+
+		middleware := sbff.Middleware(&ts.Config.Security, errCallback)
+
+		wrappedHandler := middleware(handler)
+
+		for _, h := range tc.headerValues {
+			r := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+
+			if h.rateLimiting != "" {
+				r.Header.Set(ts.Config.RateLimitHeader, h.rateLimiting)
+			}
+
+			if h.sbForwardedFor != "" {
+				r.Header.Set(sbff.HeaderName, h.sbForwardedFor)
+			}
+
+			wrappedHandler.ServeHTTP(nil, r)
+		}
+
+		require.ErrorIs(ts.T(), obsErr, tc.expErr)
+	}
+
+}
+
+func (ts *MiddlewareTestSuite) TestPerformRateLimitingWithHeader() {
 	ts.Config.RateLimitHeader = "X-Test-Perform-Rate-Limiting"
 
 	tests := []struct {
@@ -547,6 +707,62 @@ func (ts *MiddlewareTestSuite) TestLimitHandler() {
 	w := httptest.NewRecorder()
 	ts.API.limitHandler(lmt).handler(okHandler).ServeHTTP(w, req)
 	require.Equal(ts.T(), http.StatusTooManyRequests, w.Code)
+}
+
+func (ts *MiddlewareTestSuite) TestLimitRequestBodyMiddleware() {
+	const maxBytes = 1 << 10 // 1KB for testing
+
+	bodyReadHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	handler := limitRequestBody(maxBytes)(bodyReadHandler)
+
+	ts.Run("allows request within limit", func() {
+		body := bytes.NewReader(make([]byte, maxBytes-1))
+		req := httptest.NewRequest(http.MethodPost, "http://localhost", body)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		require.Equal(ts.T(), http.StatusOK, w.Code)
+		require.Equal(ts.T(), "ok", w.Body.String())
+	})
+
+	ts.Run("rejects request exceeding limit", func() {
+		body := bytes.NewReader(make([]byte, maxBytes+1))
+		req := httptest.NewRequest(http.MethodPost, "http://localhost", body)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		require.Equal(ts.T(), http.StatusRequestEntityTooLarge, w.Code)
+	})
+
+	ts.Run("allows nil body", func() {
+		req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		require.Equal(ts.T(), http.StatusOK, w.Code)
+	})
+
+	ts.Run("allows empty body", func() {
+		req := httptest.NewRequest(http.MethodPost, "http://localhost", http.NoBody)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		require.Equal(ts.T(), http.StatusOK, w.Code)
+	})
+
+	ts.Run("allows request at exact limit", func() {
+		body := bytes.NewReader(make([]byte, maxBytes))
+		req := httptest.NewRequest(http.MethodPost, "http://localhost", body)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		require.Equal(ts.T(), http.StatusOK, w.Code)
+	})
 }
 
 type MockCleanup struct {

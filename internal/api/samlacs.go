@@ -312,15 +312,15 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 		}
 		createdUser = decision == models.CreateAccount
 
-		if flowState != nil {
-			// This means that the callback is using PKCE
+		if flowState != nil && flowState.IsPKCE() {
+			// PKCE flow: update flow state with user ID
 			flowState.UserID = &(user.ID)
 			if terr := tx.Update(flowState); terr != nil {
 				return terr
 			}
 		}
 
-		token, terr = a.issueRefreshToken(r, tx, user, models.SSOSAML, grantParams)
+		token, terr = a.issueRefreshToken(r, w.Header(), tx, user, models.SSOSAML, grantParams)
 
 		if terr != nil {
 			return apierrors.NewInternalServerError("Unable to issue refresh token from SAML Assertion").WithInternalError(terr)
@@ -339,16 +339,14 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 	if !utilities.IsRedirectURLValid(config, redirectTo) {
 		redirectTo = config.SiteURL
 	}
-	if flowState != nil {
-		// This means that the callback is using PKCE
-		// Set the flowState.AuthCode to the query param here
-		redirectTo, err = a.prepPKCERedirectURL(redirectTo, flowState.AuthCode)
+	if flowState != nil && flowState.IsPKCE() {
+		// PKCE flow: redirect with auth code
+		redirectTo, err = a.prepPKCERedirectURL(redirectTo, *flowState.AuthCode)
 		if err != nil {
 			return err
 		}
 		http.Redirect(w, r, redirectTo, http.StatusFound)
 		return nil
-
 	}
 
 	// Record login for analytics - only when token is issued (not during pkce authorize)

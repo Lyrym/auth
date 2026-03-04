@@ -85,6 +85,12 @@ type AnonymousProviderConfiguration struct {
 	Enabled bool `json:"enabled" default:"false"`
 }
 
+// CustomOAuthConfiguration holds configuration for custom OAuth and OIDC providers
+type CustomOAuthConfiguration struct {
+	Enabled      bool `json:"enabled" split_words:"true" default:"false"`
+	MaxProviders int  `json:"max_providers" split_words:"true" default:"0"`
+}
+
 type EmailProviderConfiguration struct {
 	Enabled bool `json:"enabled" default:"true"`
 
@@ -137,7 +143,7 @@ type JWTConfiguration struct {
 	Issuer           string         `json:"issuer"`
 	KeyID            string         `json:"key_id" split_words:"true"`
 	Keys             JwtKeysDecoder `json:"keys"`
-	ValidMethods     []string       `json:"-"`
+	ValidMethods     []string       `json:"-" split_words:"true"`
 }
 
 type MFAFactorTypeConfiguration struct {
@@ -318,6 +324,7 @@ type GlobalConfiguration struct {
 	API           APIConfiguration
 	DB            DBConfiguration
 	External      ProviderConfiguration
+	CustomOAuth   CustomOAuthConfiguration `envconfig:"CUSTOM_OAUTH"`
 	OAuthServer   OAuthServerConfiguration `envconfig:"OAUTH_SERVER"`
 	Logging       LoggingConfig            `envconfig:"LOG"`
 	Profiler      ProfilerConfig           `envconfig:"PROFILER"`
@@ -446,6 +453,9 @@ type ProviderConfiguration struct {
 	RedirectURL             string                         `json:"redirect_url"`
 	AllowedIdTokenIssuers   []string                       `json:"allowed_id_token_issuers" split_words:"true"`
 	FlowStateExpiryDuration time.Duration                  `json:"flow_state_expiry_duration" split_words:"true"`
+
+	// OIDCProviderCacheTTL controls how long OIDC discovery documents are cached.
+	OIDCProviderCacheTTL time.Duration `json:"oidc_provider_cache_ttl" split_words:"true" default:"1h"`
 
 	Web3Solana   SolanaConfiguration   `json:"web3_solana" split_words:"true"`
 	Web3Ethereum EthereumConfiguration `json:"web3_ethereum" split_words:"true"`
@@ -726,12 +736,15 @@ func (c *DatabaseEncryptionConfiguration) Validate() error {
 
 type SecurityConfiguration struct {
 	Captcha                               CaptchaConfiguration `json:"captcha"`
+	RefreshTokenUpgradePercentage         int                  `json:"refresh_token_upgrade_percentage" split_words:"true"`
 	RefreshTokenAlgorithmVersion          int                  `json:"refresh_token_algorithm_version" split_words:"true"`
 	RefreshTokenRotationEnabled           bool                 `json:"refresh_token_rotation_enabled" split_words:"true" default:"true"`
 	RefreshTokenReuseInterval             int                  `json:"refresh_token_reuse_interval" split_words:"true"`
 	RefreshTokenAllowReuse                bool                 `json:"refresh_token_allow_reuse" split_words:"true"`
 	UpdatePasswordRequireReauthentication bool                 `json:"update_password_require_reauthentication" split_words:"true"`
+	UpdatePasswordRequireCurrentPassword  bool                 `json:"update_password_require_current_password" split_words:"true"`
 	ManualLinkingEnabled                  bool                 `json:"manual_linking_enabled" split_words:"true" default:"false"`
+	SbForwardedForEnabled                 bool                 `json:"sb_forwarded_for_enabled" split_words:"true" default:"false"`
 
 	DBEncryption DatabaseEncryptionConfiguration `json:"database_encryption" split_words:"true"`
 }
@@ -743,6 +756,14 @@ func (c *SecurityConfiguration) Validate() error {
 
 	if err := c.DBEncryption.Validate(); err != nil {
 		return err
+	}
+
+	if c.RefreshTokenAlgorithmVersion < 0 || c.RefreshTokenAlgorithmVersion > 2 {
+		return fmt.Errorf("refresh token algorithm version must be 0, 1 or 2 but was %v", c.RefreshTokenAlgorithmVersion)
+	}
+
+	if c.RefreshTokenUpgradePercentage < 0 || c.RefreshTokenUpgradePercentage > 100 {
+		return fmt.Errorf("refresh token upgrade percentage must be between 0 and 100, but was %v", c.RefreshTokenUpgradePercentage)
 	}
 
 	return nil
@@ -1347,7 +1368,11 @@ func (t *SmsProviderConfiguration) IsTwilioVerifyProvider() bool {
 	return t.Provider == "twilio_verify"
 }
 
-// IndexWorkerConfiguration holds the configuration for database indexes.
+// IndexWorkerConfiguration holds the configuration for creating database indexes on the users table.
 type IndexWorkerConfiguration struct {
+	// user opt-in — when true, always create indexes (threshold is ignored).
 	EnsureUserSearchIndexesExist bool `json:"ensure_user_search_indexes_exist" split_words:"true" default:"false"`
+	// progressive rollout — when > 0, create indexes only if user count ≤ threshold.
+	// A value of 0 means disabled. Has no effect when EnsureUserSearchIndexesExist is true.
+	MaxUsersThreshold int64 `json:"max_users_threshold" split_words:"true" default:"0"`
 }
